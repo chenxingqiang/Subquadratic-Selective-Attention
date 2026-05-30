@@ -148,6 +148,8 @@ class CodebookRouter(nn.Module):
 
         return indices
 
+    # Candidate selection only produces integer indices (non-differentiable),
+    # so disable gradient tracking to avoid building an autograd graph.
     @torch.no_grad()
     def _select_candidates(
         self,
@@ -257,7 +259,7 @@ class CodebookRouter(nn.Module):
             k_code_assign: [seq_len, num_kv_heads, b] — codes assigned to each key
 
         Returns:
-            mask: [n_q, num_kv_heads, seq_len] True where key is candidate
+            mask: [n_q, num_kv_heads, seq_len] True where key is candidate.
         """
         n_q = top_q_codes.shape[0]
         n = seq_len
