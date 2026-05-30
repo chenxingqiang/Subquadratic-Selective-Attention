@@ -148,6 +148,7 @@ class CodebookRouter(nn.Module):
 
         return indices
 
+    @torch.no_grad()
     def _select_candidates(
         self,
         q_full: torch.Tensor,
@@ -156,6 +157,7 @@ class CodebookRouter(nn.Module):
         k_code_assign: torch.Tensor,
         top_q_codes: torch.Tensor,
         causal_mask: Optional[torch.Tensor],
+        query_chunk: int = 256,
     ) -> torch.Tensor:
         """Select top-k candidates using codebook index matching + full-dimensional re-scoring.
 
@@ -164,6 +166,12 @@ class CodebookRouter(nn.Module):
             2. Re-score candidates with full Q/K dot products
             3. Take top-k
 
+        The re-scoring + masking + top-k are streamed over query chunks so that
+        peak memory is O(query_chunk · seq_len · h) rather than O(seq_len² · h).
+        Because this path only produces integer candidate indices (which are not
+        differentiable), it runs under ``torch.no_grad`` to avoid building an
+        autograd graph for the score tensor.
+
         Returns:
             indices: [seq_len, num_kv_heads, top_k] candidate key indices
         """
@@ -171,38 +179,47 @@ class CodebookRouter(nn.Module):
         num_kv_heads = self.num_kv_heads
         device = q_full.device
 
-        # Group Q heads to KV head groups for re-scoring
+        # Group Q heads to KV head groups for re-scoring. The routing score is the
+        # mean over GQA group heads; since the score is linear in Q, the group mean
+        # can be taken *before* the dot product instead of materializing the full
+        # [seq_len, h, group_size, seq_len] tensor. This is mathematically identical
+        # but avoids the group_size factor in compute and memory.
         num_q_heads = q_full.shape[1]
         group_size = num_q_heads // num_kv_heads
-        q_full_grouped = q_full.view(seq_len, num_kv_heads, group_size, self.head_dim)
+        q_grouped_mean = q_full.view(
+            seq_len, num_kv_heads, group_size, self.head_dim
+        ).mean(dim=2)  # [seq_len, num_kv_heads, head_dim]
 
-        # Compute full attention scores for candidate re-scoring
-        full_scores = torch.einsum(
-            "shgd,thd->shgt", q_full_grouped, k_full
-        ) / (self.head_dim**0.5)
-        # full_scores: [seq_len, num_kv_heads, group_size, seq_len]
-
-        if causal_mask is not None:
-            full_scores = full_scores.masked_fill(
-                ~causal_mask.unsqueeze(1).unsqueeze(2), float("-inf")
-            )
-
-        # Aggregate across group heads for ranking
-        full_scores_routing = full_scores.mean(dim=2)  # [seq_len, num_kv_heads, seq_len]
-
-        # Build candidate mask using code matching
-        candidate_mask = self._build_candidate_mask(
-            top_q_codes, k_code_assign, seq_len, num_kv_heads, device
-        )
-        # candidate_mask: [seq_len, num_kv_heads, seq_len]
-
-        # Apply candidate mask to scores
-        full_scores_routing = full_scores_routing.masked_fill(~candidate_mask, float("-inf"))
-
-        # Select top-k per query (clamp to seq_len for short sequences)
+        scale = self.head_dim**0.5
         effective_k = min(self.top_k, seq_len)
-        _, indices = full_scores_routing.topk(effective_k, dim=-1)
-        # Pad to top_k size if needed (for shape consistency)
+
+        indices_chunks = []
+        for q_start in range(0, seq_len, query_chunk):
+            q_end = min(q_start + query_chunk, seq_len)
+            q_mean_chunk = q_grouped_mean[q_start:q_end]  # [qc, num_kv_heads, head_dim]
+
+            # Re-score this query chunk against all keys: [qc, num_kv_heads, seq_len]
+            scores_chunk = torch.einsum(
+                "shd,thd->sht", q_mean_chunk, k_full
+            ) / scale
+
+            if causal_mask is not None:
+                scores_chunk = scores_chunk.masked_fill(
+                    ~causal_mask[q_start:q_end].unsqueeze(1), float("-inf")
+                )
+
+            # Restrict to keys that share at least one code with the query
+            candidate_mask = self._build_candidate_mask(
+                top_q_codes[q_start:q_end], k_code_assign, seq_len, num_kv_heads, device
+            )  # [qc, num_kv_heads, seq_len]
+            scores_chunk = scores_chunk.masked_fill(~candidate_mask, float("-inf"))
+
+            _, idx_chunk = scores_chunk.topk(effective_k, dim=-1)
+            indices_chunks.append(idx_chunk)
+
+        indices = torch.cat(indices_chunks, dim=0)  # [seq_len, num_kv_heads, effective_k]
+
+        # Pad to top_k size if needed (for shape consistency on short sequences)
         if effective_k < self.top_k:
             pad = torch.zeros(
                 seq_len, num_kv_heads, self.top_k - effective_k,
@@ -226,35 +243,38 @@ class CodebookRouter(nn.Module):
         For each query at position i and head h, a key at position j is a
         candidate if they share at least one code assignment.
 
+        ``top_q_codes`` may cover only a chunk of the query positions; the number
+        of query rows is taken from its leading dimension, while the key
+        dimension spans the full ``seq_len``.
+
         Args:
-            top_q_codes: [seq_len, num_kv_heads, a] — codes selected by each query
+            top_q_codes: [n_q, num_kv_heads, a] — codes selected by each query
             k_code_assign: [seq_len, num_kv_heads, b] — codes assigned to each key
 
         Returns:
-            mask: [seq_len, num_kv_heads, seq_len] True where key is candidate
+            mask: [n_q, num_kv_heads, seq_len] True where key is candidate
         """
+        n_q = top_q_codes.shape[0]
         n = seq_len
         h = num_kv_heads
         a = self.codes_per_query
         b = self.codes_per_key
 
-        mask = torch.zeros(n, h, n, dtype=torch.bool, device=device)
+        mask = torch.zeros(n_q, h, n, dtype=torch.bool, device=device)
 
-        # Process key positions in chunks to avoid O(n²·h·a·b) broadcast
-        # Original: code_match [n, n, h, a, b] = 134MB at n=1024
-        # Chunked: code_match [n, K_CHUNK, h, a, b] = ~17MB at K_CHUNK=128
+        # Process key positions in chunks to avoid the O(n_q·n·h·a·b) broadcast
         K_CHUNK = min(128, n)
         for kj_start in range(0, n, K_CHUNK):
             kj_end = min(kj_start + K_CHUNK, n)
             k_chunk = k_code_assign[kj_start:kj_end]  # [K_CHUNK, h, b]
 
             # Broadcast: [n_q, 1, h, 1, a] x [1, K_CHUNK, h, b, 1]
-            q_exp = top_q_codes.view(n, 1, h, 1, a)        # [n, 1, h, 1, a]
+            q_exp = top_q_codes.view(n_q, 1, h, 1, a)            # [n_q, 1, h, 1, a]
             k_exp = k_chunk.view(1, kj_end - kj_start, h, b, 1)  # [1, K_CHUNK, h, b, 1]
 
-            match = (q_exp == k_exp)                      # [n, K_CHUNK, h, a, b]
-            any_match = match.any(dim=-1).any(dim=-1)     # [n, K_CHUNK, h]
-            mask[:, :, kj_start:kj_end] = any_match.permute(0, 2, 1)  # [n, h, K_CHUNK]
+            match = (q_exp == k_exp)                      # [n_q, K_CHUNK, h, a, b]
+            any_match = match.any(dim=-1).any(dim=-1)     # [n_q, K_CHUNK, h]
+            mask[:, :, kj_start:kj_end] = any_match.permute(0, 2, 1)  # [n_q, h, K_CHUNK]
 
         return mask
 
