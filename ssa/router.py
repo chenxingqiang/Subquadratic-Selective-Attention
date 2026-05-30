@@ -172,6 +172,11 @@ class CodebookRouter(nn.Module):
         differentiable), it runs under ``torch.no_grad`` to avoid building an
         autograd graph for the score tensor.
 
+        Args:
+            query_chunk: Number of query positions processed per streaming step.
+                Controls the memory/throughput trade-off; peak score memory is
+                O(query_chunk · seq_len · h). Defaults to 256.
+
         Returns:
             indices: [seq_len, num_kv_heads, top_k] candidate key indices
         """
