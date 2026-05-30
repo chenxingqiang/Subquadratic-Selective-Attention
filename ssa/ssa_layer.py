@@ -38,6 +38,7 @@ class SSAAttention(nn.Module):
         codes_per_query: int = 8,
         top_k: int = 64,
         bias: bool = False,
+        causal: bool = True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -45,6 +46,9 @@ class SSAAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.top_k = top_k
+        # Whether to apply causal masking. True (default) for autoregressive /
+        # decoder use; set False for bidirectional / encoder-style attention.
+        self.causal = causal
 
         assert num_q_heads % num_kv_heads == 0
 
@@ -109,7 +113,11 @@ class SSAAttention(nn.Module):
                 else:
                     freqs_b = freqs[:seq_len]
 
-            causal_mask = build_causal_mask(seq_len, device=hidden_states.device)
+            causal_mask = (
+                build_causal_mask(seq_len, device=hidden_states.device)
+                if self.causal
+                else None
+            )
 
             # Apply RoPE to full Q/K (for attention scoring) if freqs available
             if freqs is not None and freqs_b is not None:

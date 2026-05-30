@@ -1,0 +1,10 @@
+# Core runtime dependency
+torch>=2.1
+
+# Test suite
+pytest>=7.0
+
+# Optional — production sparse path (CUDA only) and Qwen integration.
+# Uncomment to install:
+# triton>=2.0
+# transformers>=4.40

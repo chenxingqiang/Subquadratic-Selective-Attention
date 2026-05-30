@@ -78,60 +78,75 @@ AGENTS.md             Notes for AI coding agents working in this repo
 The prototype targets Python ≥ 3.10 and PyTorch ≥ 2.1.
 
 ```bash
-git clone https://github.com/chenxingqiang/SSA.git
-cd SSA
+git clone https://github.com/chenxingqiang/Subquadratic-Selective-Attention.git
+cd Subquadratic-Selective-Attention
 
 # Recommended: a virtual environment
 python -m venv .venv
 source .venv/bin/activate
 
-pip install torch pytest
-# Optional, for the production sparse path and Qwen integration:
-pip install triton transformers
+# Install the `ssa` package (editable) plus its runtime dependency
+pip install -e .
+
+# For the test suite:
+pip install -e ".[test]"
+# Optional, for the production sparse path and Qwen integration (CUDA only):
+pip install -e ".[prod]"
 ```
 
-There is no `setup.py` yet — the `ssa` package is imported directly from the
-repository root.
+After `pip install -e .` the `ssa` package is importable from anywhere; you no
+longer need to run from the repository root. Alternatively, install just the
+dependencies with `pip install -r requirements.txt`.
 
 ---
 
 ## Quick start
 
-Use `SSAAttention` as a drop-in replacement for scaled dot-product attention:
+Use `SSAAttention` as a drop-in replacement for scaled dot-product attention.
+The constructor uses descriptive names (the short symbols from
+[`ssa_design.md`](ssa_design.md) are noted in comments):
 
 ```python
 import torch
 from ssa import SSAAttention
 
-n, d_model = 1024, 512
-h_q, h_kv = 8, 2          # GQA: 8 query heads, 2 KV heads
-d_head = d_model // h_q
+n, hidden_size = 1024, 512
 
 attn = SSAAttention(
-    d_model=d_model,
-    h_q=h_q,
-    h_kv=h_kv,
-    d_head=d_head,
-    d_s=32,               # routing dimension
-    n_c=2048,             # codebook size
-    b=4,                  # codes per key
-    a=16,                 # codes per query
-    k=256,                # candidates per query
-    causal=True,
+    hidden_size=hidden_size,   # d_model
+    num_q_heads=8,             # h_q  (GQA: 8 query heads)
+    num_kv_heads=2,            # h_kv (GQA: 2 KV heads)
+    head_dim=64,               # d_head
+    route_dim=32,              # d_s — routing dimension
+    num_codebook=2048,         # N_c — codebook size
+    codes_per_key=4,           # b — codes per key
+    codes_per_query=16,        # a — codes per query
+    top_k=256,                 # k — candidates per query
+    causal=True,               # set False for bidirectional / encoder use
 )
 
-x = torch.randn(2, n, d_model)
-y = attn(x)               # (2, n, d_model)
+x = torch.randn(2, n, hidden_size)
+y = attn(x)                    # (2, n, hidden_size)
 ```
 
 Or use the lower-level pieces directly:
 
 ```python
-from ssa import CodebookRouter, sparse_exact_attention, dense_attention
+import torch
+from ssa import CodebookRouter, sparse_exact_attention, build_causal_mask
 
-router = CodebookRouter(d=d_head, d_s=32, n_c=2048, b=4, a=16, k=256)
-candidates = router(Q, K, causal=True)            # [n, h_kv, k] indices
-out = sparse_exact_attention(Q, K, V, candidates) # exact attention on those k keys
+n, h_q, h_kv, d_head = 64, 8, 2, 64
+Q = torch.randn(n, h_q, d_head)
+K = torch.randn(n, h_kv, d_head)
+V = torch.randn(n, h_kv, d_head)
+
+router = CodebookRouter(
+    head_dim=d_head, route_dim=32, num_kv_heads=h_kv,
+    num_codebook=2048, codes_per_key=4, codes_per_query=16, top_k=32,
+)
+mask = build_causal_mask(n)                          # omit for non-causal
+candidates = router(Q, K, causal_mask=mask, hard=True)  # [n, h_kv, top_k] indices
+out = sparse_exact_attention(Q, K, V, candidates)       # exact attention on those keys
 ```
 
 ---

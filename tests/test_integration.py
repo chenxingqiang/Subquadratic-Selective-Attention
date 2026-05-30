@@ -107,6 +107,34 @@ class TestEndToEnd:
         assert loss >= 0, f"KL divergence should be non-negative, got {loss.item()}"
         assert not torch.isnan(loss).any()
 
+    def test_causal_flag_default_true(self, ssa):
+        """SSAAttention should default to causal attention."""
+        assert ssa.causal is True
+
+    def test_bidirectional_toggle(self):
+        """causal=False should enable bidirectional attention and differ from causal."""
+        kwargs = dict(
+            hidden_size=256, num_q_heads=4, num_kv_heads=1, head_dim=64,
+            route_dim=16, num_codebook=128, codes_per_key=4, codes_per_query=8,
+            top_k=16,
+        )
+        causal = SSAAttention(causal=True, **kwargs)
+        bidir = SSAAttention(causal=False, **kwargs)
+        # Share weights so only the masking differs
+        bidir.load_state_dict(causal.state_dict())
+
+        x = torch.randn(1, 32, 256)
+        out_causal = causal(x)
+        out_bidir = bidir(x)
+
+        assert out_bidir.shape == x.shape
+        assert not torch.isnan(out_bidir).any()
+        assert bidir.causal is False
+        # Bidirectional attention sees future tokens, so output must differ.
+        assert not torch.allclose(out_causal, out_bidir), (
+            "causal and bidirectional outputs should differ"
+        )
+
 
 class TestToyTransformerBlock:
     """Tests for the toy transformer block."""
